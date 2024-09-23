@@ -1,3 +1,4 @@
+release_repo_url: git@github.com:revyos-ros/Universal_Robots_Client_Library-release.git
 tracks:
   foxy:
     actions:
