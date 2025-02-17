@@ -1,3 +1,26 @@
+## ur_client_library (humble) - 1.6.0-1
+
+The packages in the `ur_client_library` repository were released into the `humble` distro by running `/home/z572/gits/revyos-ros/venv2/bin/bloom-release -r humble ur_client_library --override-release-repository-push-url git@github.com:revyos-ros/Universal_Robots_Client_Library-release.git` on `Mon, 17 Feb 2025 04:33:09 -0000`
+
+The `ur_client_library` package was released.
+
+Version of package(s) in repository `ur_client_library`:
+
+- upstream repository: https://github.com/UniversalRobots/Universal_Robots_Client_Library
+- release repository: https://github.com/revyos-ros/Universal_Robots_Client_Library-release.git
+- rosdistro version: `1.6.0-1`
+- old version: `1.5.0-1`
+- new version: `1.6.0-1`
+
+Versions of tools used:
+
+- bloom version: `0.12.0`
+- catkin_pkg version: `1.0.0`
+- rosdep version: `0.22.2`
+- rosdistro version: `0.9.0`
+- vcstools version: `0.1.42`
+
+
 ## ur_client_library (jazzy) - 1.5.0-1
 
 The packages in the `ur_client_library` repository were released into the `jazzy` distro by running `/home/z572/gits/revyos-ros/venv2/bin/bloom-release -r jazzy ur_client_library --override-release-repository-push-url git@github.com:revyos-ros/Universal_Robots_Client_Library-release.git` on `Thu, 19 Dec 2024 08:12:04 -0000`
