@@ -31,10 +31,12 @@
 #include <gtest/gtest.h>
 
 #include <ur_client_library/control/trajectory_point_interface.h>
+#include <ur_client_library/example_robot_wrapper.h>
 #include <ur_client_library/ur/dashboard_client.h>
 #include <ur_client_library/ur/ur_driver.h>
 #include <ur_client_library/types.h>
 
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <math.h>
@@ -49,65 +51,22 @@ const std::string SPLINE_SCRIPT_FILE = "spline_external_control.urscript";
 const std::string OUTPUT_RECIPE = "resources/rtde_output_recipe_spline.txt";
 const std::string INPUT_RECIPE = "resources/rtde_input_recipe.txt";
 const std::string CALIBRATION_CHECKSUM = "calib_12788084448423163542";
-std::string ROBOT_IP = "192.168.56.101";
+std::string g_ROBOT_IP = "192.168.56.101";
+bool g_HEADLESS = true;
 
-std::unique_ptr<UrDriver> g_ur_driver_;
-std::unique_ptr<DashboardClient> g_dashboard_client_;
+std::unique_ptr<ExampleRobotWrapper> g_my_robot;
 
-bool g_program_running;
-std::condition_variable g_program_not_running_cv_;
-std::mutex g_program_not_running_mutex_;
-std::condition_variable g_program_running_cv_;
-std::mutex g_program_running_mutex_;
-
-// Helper functions for the driver
-void handleRobotProgramState(bool program_running)
-{
-  // Print the text in green so we see it better
-  std::cout << "\033[1;32mProgram running: " << std::boolalpha << program_running << "\033[0m\n" << std::endl;
-  if (program_running)
-  {
-    std::lock_guard<std::mutex> lk(g_program_running_mutex_);
-    g_program_running = program_running;
-    g_program_running_cv_.notify_one();
-  }
-  else
-  {
-    std::lock_guard<std::mutex> lk(g_program_not_running_mutex_);
-    g_program_running = program_running;
-    g_program_not_running_cv_.notify_one();
-  }
-}
-
-bool g_trajectory_running_;
-control::TrajectoryResult g_trajectory_result_;
+bool g_trajectory_running;
+std::condition_variable g_trajectory_result_cv;
+std::mutex g_trajectory_result_mutex;
+control::TrajectoryResult g_trajectory_result;
 void handleTrajectoryState(control::TrajectoryResult state)
 {
-  g_trajectory_result_ = state;
-  g_trajectory_running_ = false;
-}
-
-bool g_rtde_read_thread_running_ = false;
-bool g_consume_rtde_packages_ = false;
-std::mutex g_read_package_mutex_;
-std::thread g_rtde_read_thread;
-
-void rtdeConsumeThread()
-{
-  while (g_rtde_read_thread_running_)
-  {
-    // Consume package to prevent pipeline overflow
-    if (g_consume_rtde_packages_ == true)
-    {
-      std::lock_guard<std::mutex> lk(g_read_package_mutex_);
-      std::unique_ptr<rtde_interface::DataPackage> data_pkg;
-      data_pkg = g_ur_driver_->getDataPackage();
-    }
-    else
-    {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-  }
+  std::lock_guard<std::mutex> lk(g_trajectory_result_mutex);
+  g_trajectory_result_cv.notify_one();
+  g_trajectory_result = state;
+  URCL_LOG_INFO("Received trajectory result %s", control::trajectoryResultToString(state).c_str());
+  g_trajectory_running = false;
 }
 
 int sign(double val)
@@ -115,10 +74,16 @@ int sign(double val)
   return (0.0 < val) - (val < 0.0);
 }
 
-bool nearly_equal(double a, double b, double eps = 1e-15)
+bool nearlyEqual(double a, double b, double eps = 1e-15)
 {
   const double c(a - b);
   return c < eps || -c < eps;
+}
+
+bool waitForTrajectoryResult(std::chrono::milliseconds timeout)
+{
+  std::unique_lock<std::mutex> lk(g_trajectory_result_mutex);
+  return g_trajectory_result_cv.wait_for(lk, timeout) == std::cv_status::no_timeout;
 }
 
 class SplineInterpolationTest : public ::testing::Test
@@ -126,21 +91,6 @@ class SplineInterpolationTest : public ::testing::Test
 protected:
   static void SetUpTestSuite()
   {
-    g_dashboard_client_.reset(new DashboardClient(ROBOT_IP));
-    ASSERT_TRUE(g_dashboard_client_->connect());
-
-    // Make robot ready for test
-    timeval tv;
-    tv.tv_sec = 10;
-    tv.tv_usec = 0;
-    g_dashboard_client_->setReceiveTimeout(tv);
-
-    // Stop running program if there is one
-    ASSERT_TRUE(g_dashboard_client_->commandStop());
-
-    // if the robot is not powered on and ready
-    ASSERT_TRUE(g_dashboard_client_->commandBrakeRelease());
-
     // Add splineTimerTraveled to output registers to check for correct computation on test side
     std::ifstream in_file(SCRIPT_FILE);
     std::string prog((std::istreambuf_iterator<char>(in_file)), (std::istreambuf_iterator<char>()));
@@ -159,40 +109,19 @@ protected:
     out_file.close();
 
     // Setup driver
-    std::unique_ptr<ToolCommSetup> tool_comm_setup;
-    const bool HEADLESS = true;
-    try
-    {
-      g_ur_driver_.reset(new UrDriver(ROBOT_IP, SPLINE_SCRIPT_FILE, OUTPUT_RECIPE, INPUT_RECIPE,
-                                      &handleRobotProgramState, HEADLESS, std::move(tool_comm_setup),
-                                      CALIBRATION_CHECKSUM));
-    }
-    catch (UrException& exp)
-    {
-      std::cout << "caught exception " << exp.what() << " while launch driver, retrying once in 10 seconds"
-                << std::endl;
-      std::this_thread::sleep_for(std::chrono::seconds(10));
-      g_ur_driver_.reset(new UrDriver(ROBOT_IP, SPLINE_SCRIPT_FILE, OUTPUT_RECIPE, INPUT_RECIPE,
-                                      &handleRobotProgramState, HEADLESS, std::move(tool_comm_setup),
-                                      CALIBRATION_CHECKSUM));
-    }
+    g_my_robot = std::make_unique<ExampleRobotWrapper>(g_ROBOT_IP, OUTPUT_RECIPE, INPUT_RECIPE, g_HEADLESS,
+                                                       "external_control.urp", SPLINE_SCRIPT_FILE);
 
-    g_ur_driver_->registerTrajectoryDoneCallback(&handleTrajectoryState);
+    g_my_robot->startRTDECommununication(true);
 
-    g_ur_driver_->startRTDECommunication();
-    // Setup rtde read thread
-    g_rtde_read_thread_running_ = true;
-    g_rtde_read_thread = std::thread(rtdeConsumeThread);
+    g_my_robot->ur_driver_->registerTrajectoryDoneCallback(&handleTrajectoryState);
   }
 
   static void TearDownTestSuite()
   {
     // Set target speed scaling to 100% as one test change this value
-    g_ur_driver_->getRTDEWriter().sendSpeedSlider(1);
+    g_my_robot->ur_driver_->getRTDEWriter().sendSpeedSlider(1);
 
-    g_rtde_read_thread_running_ = false;
-    g_rtde_read_thread.join();
-    g_dashboard_client_->disconnect();
     // Remove temporary file again
     std::remove(SPLINE_SCRIPT_FILE.c_str());
   }
@@ -200,51 +129,51 @@ protected:
   void TearDown()
   {
     // Set target speed scaling to 100% as one test change this value
-    g_ur_driver_->getRTDEWriter().sendSpeedSlider(1);
+    g_my_robot->ur_driver_->getRTDEWriter().sendSpeedSlider(1);
   }
 
   void SetUp()
   {
     step_time_ = 0.002;
-    if (g_ur_driver_->getVersion().major < 5)
+    if (g_my_robot->ur_driver_->getVersion().major < 5)
     {
       step_time_ = 0.008;
     }
-    // Make sure script is running on the robot
-    if (g_program_running == false)
+    std::string safety_status;
+    g_my_robot->dashboard_client_->commandSafetyStatus(safety_status);
+    bool is_protective_stopped = safety_status.find("PROTECTIVE_STOP") != std::string::npos;
+    if (is_protective_stopped)
     {
-      g_consume_rtde_packages_ = true;
-      g_ur_driver_->sendRobotProgram();
-      ASSERT_TRUE(waitForProgramRunning(1000));
+      // We forced a protective stop above. Some versions require waiting 5 seconds before releasing
+      // the protective stop.
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      g_my_robot->dashboard_client_->commandCloseSafetyPopup();
+      ASSERT_TRUE(g_my_robot->dashboard_client_->commandUnlockProtectiveStop());
     }
-    g_consume_rtde_packages_ = false;
-  }
-
-  void sendIdle()
-  {
-    ASSERT_TRUE(g_ur_driver_->writeKeepalive(RobotReceiveTimeout::sec()));
+    ASSERT_TRUE(g_my_robot->isHealthy());
   }
 
   void sendTrajectory(const std::vector<urcl::vector6d_t>& s_pos, const std::vector<urcl::vector6d_t>& s_vel,
                       const std::vector<urcl::vector6d_t>& s_acc, const std::vector<double>& s_time)
   {
-    ASSERT_TRUE(g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
+    ASSERT_TRUE(g_my_robot->ur_driver_->writeTrajectoryControlMessage(
+        urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
 
     // Send trajectory to robot for execution
-    ASSERT_TRUE(g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_START,
-                                                            s_pos.size()));
+    ASSERT_TRUE(g_my_robot->ur_driver_->writeTrajectoryControlMessage(
+        urcl::control::TrajectoryControlMessage::TRAJECTORY_START, s_pos.size()));
 
     for (size_t i = 0; i < s_pos.size(); i++)
     {
       // QUINTIC
       if (s_pos.size() == s_acc.size())
       {
-        g_ur_driver_->writeTrajectorySplinePoint(s_pos[i], s_vel[i], s_acc[i], s_time[i]);
+        g_my_robot->ur_driver_->writeTrajectorySplinePoint(s_pos[i], s_vel[i], s_acc[i], s_time[i]);
       }
       // CUBIC
       else
       {
-        g_ur_driver_->writeTrajectorySplinePoint(s_pos[i], s_vel[i], s_time[i]);
+        g_my_robot->ur_driver_->writeTrajectorySplinePoint(s_pos[i], s_vel[i], s_time[i]);
       }
     }
   }
@@ -324,13 +253,13 @@ protected:
     while (trajectory_started == false)
     {
       std::unique_ptr<rtde_interface::DataPackage> data_pkg;
-      readDataPackage(data_pkg);
+      g_my_robot->readDataPackage(data_pkg);
       double spline_travel_time = 0.0;
       data_pkg->getData("output_double_register_1", spline_travel_time);
 
       // Keep connection alive
-      ASSERT_TRUE(
-          g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
+      ASSERT_TRUE(g_my_robot->ur_driver_->writeTrajectoryControlMessage(
+          urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
       if (std::abs(spline_travel_time - 0.0) < 0.01)
       {
         return;
@@ -343,44 +272,6 @@ protected:
         GTEST_FAIL();
       }
       cur_time += step_time_;
-    }
-  }
-
-  bool waitForProgramRunning(int milliseconds = 100)
-  {
-    std::unique_lock<std::mutex> lk(g_program_running_mutex_);
-    if (g_program_running_cv_.wait_for(lk, std::chrono::milliseconds(milliseconds)) == std::cv_status::no_timeout ||
-        g_program_running == true)
-    {
-      return true;
-    }
-    return false;
-  }
-
-  bool waitForProgramNotRunning(int milliseconds = 100)
-  {
-    std::unique_lock<std::mutex> lk(g_program_not_running_mutex_);
-    if (g_program_not_running_cv_.wait_for(lk, std::chrono::milliseconds(milliseconds)) == std::cv_status::no_timeout ||
-        g_program_running == false)
-    {
-      return true;
-    }
-    return false;
-  }
-
-  void readDataPackage(std::unique_ptr<rtde_interface::DataPackage>& data_pkg)
-  {
-    if (g_consume_rtde_packages_ == true)
-    {
-      URCL_LOG_ERROR("Unable to read packages while consuming, this should not happen!");
-      GTEST_FAIL();
-    }
-    std::lock_guard<std::mutex> lk(g_read_package_mutex_);
-    data_pkg = g_ur_driver_->getDataPackage();
-    if (data_pkg == nullptr)
-    {
-      URCL_LOG_ERROR("Timed out waiting for a new package from the robot");
-      GTEST_FAIL();
     }
   }
 
@@ -453,8 +344,10 @@ protected:
 
 TEST_F(SplineInterpolationTest, cubic_spline_with_end_point_velocity)
 {
+  g_my_robot->stopConsumingRTDEData();
   std::unique_ptr<rtde_interface::DataPackage> data_pkg;
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
+  ASSERT_TRUE(data_pkg != nullptr);
 
   urcl::vector6d_t joint_positions, joint_velocities, joint_acc;
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions));
@@ -483,23 +376,24 @@ TEST_F(SplineInterpolationTest, cubic_spline_with_end_point_velocity)
 
   // Send the trajectory to the robot
   sendTrajectory(s_pos, s_vel, std::vector<urcl::vector6d_t>(), s_time);
-  g_trajectory_running_ = true;
+  g_trajectory_running = true;
 
   // Make sure that the trajectory has started before we start testing for trajectory execution
   waitForTrajectoryStarted();
 
   double old_spline_travel_time = 0.0;
   double plot_time = 0.0;
-  while (g_trajectory_running_)
+  while (g_trajectory_running)
   {
-    readDataPackage(data_pkg);
+    g_my_robot->readDataPackage(data_pkg);
     ASSERT_TRUE(data_pkg->getData("target_q", joint_positions));
     ASSERT_TRUE(data_pkg->getData("target_qd", joint_velocities));
     ASSERT_TRUE(data_pkg->getData("target_qdd", joint_acc));
     ASSERT_TRUE(data_pkg->getData("speed_scaling", speed_scaling));
 
     // Keep connection alive
-    ASSERT_TRUE(g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
+    ASSERT_TRUE(g_my_robot->ur_driver_->writeTrajectoryControlMessage(
+        urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
 
     // Read spline travel time from the robot
     double spline_travel_time = 0.0;
@@ -542,10 +436,10 @@ TEST_F(SplineInterpolationTest, cubic_spline_with_end_point_velocity)
     spline_time.push_back(spline_travel_time);
     plot_time += step_time_;
   }
-  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_SUCCESS, g_trajectory_result_);
+  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_SUCCESS, g_trajectory_result);
 
   // Make sure the velocity is zero when the trajectory has finished
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
   ASSERT_TRUE(data_pkg->getData("target_qd", joint_velocities));
   for (unsigned int i = 0; i < 6; ++i)
   {
@@ -563,16 +457,13 @@ TEST_F(SplineInterpolationTest, cubic_spline_with_end_point_velocity)
 
 TEST_F(SplineInterpolationTest, quintic_spline_with_end_point_velocity_with_speedscaling)
 {
+  g_my_robot->stopConsumingRTDEData();
   // Set speed scaling to 25% to test interpolation with speed scaling active
-  const unsigned int REDUSE_FACTOR(4);
-  g_ur_driver_->getRTDEWriter().sendSpeedSlider(1.0 / REDUSE_FACTOR);
+  const unsigned int reduse_factor(4);
+  g_my_robot->ur_driver_->getRTDEWriter().sendSpeedSlider(1.0 / reduse_factor);
 
   std::unique_ptr<rtde_interface::DataPackage> data_pkg;
-  readDataPackage(data_pkg);
-
-  // Align timestep
-  sendIdle();
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
 
   urcl::vector6d_t joint_positions, joint_velocities, joint_acc;
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions));
@@ -604,7 +495,7 @@ TEST_F(SplineInterpolationTest, quintic_spline_with_end_point_velocity_with_spee
 
   // Send trajectory to the robot
   sendTrajectory(s_pos, s_vel, s_acc, s_time);
-  g_trajectory_running_ = true;
+  g_trajectory_running = true;
 
   // Make sure that trajectory has started before we start testing for trajectory execution
   waitForTrajectoryStarted();
@@ -614,10 +505,10 @@ TEST_F(SplineInterpolationTest, quintic_spline_with_end_point_velocity_with_spee
   unsigned int loop_count = 0;
   bool init_acc_test = true;
   urcl::vector6d_t last_joint_acc = joint_acc, last_change_acc;
-  const double EPS_ACC_CHANGE(1e-15);
-  while (g_trajectory_running_)
+  const double eps_acc_change(1e-15);
+  while (g_trajectory_running)
   {
-    readDataPackage(data_pkg);
+    g_my_robot->readDataPackage(data_pkg);
     ASSERT_TRUE(data_pkg->getData("target_q", joint_positions));
     ASSERT_TRUE(data_pkg->getData("target_qd", joint_velocities));
     ASSERT_TRUE(data_pkg->getData("target_qdd", joint_acc));
@@ -635,7 +526,8 @@ TEST_F(SplineInterpolationTest, quintic_spline_with_end_point_velocity_with_spee
     double time_left = s_time[0] - spline_travel_time;
 
     // Keep connection alive
-    ASSERT_TRUE(g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
+    ASSERT_TRUE(g_my_robot->ur_driver_->writeTrajectoryControlMessage(
+        urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
 
     // Ensure that we follow the joint trajectory
     urcl::vector6d_t expected_joint_positions, change_acc;
@@ -653,7 +545,7 @@ TEST_F(SplineInterpolationTest, quintic_spline_with_end_point_velocity_with_spee
       last_change_acc.fill(0.0);
     }
 
-    if (loop_count % REDUSE_FACTOR == 0)
+    if (loop_count % reduse_factor == 0)
     {
       last_joint_acc = joint_acc;
       last_change_acc.fill(0.0);
@@ -664,7 +556,7 @@ TEST_F(SplineInterpolationTest, quintic_spline_with_end_point_velocity_with_spee
       {
         change_acc[i] = joint_acc[i] - last_joint_acc[i];
 
-        if (!nearly_equal(change_acc[i], 0.0, EPS_ACC_CHANGE) && !nearly_equal(last_change_acc[i], 0.0, EPS_ACC_CHANGE))
+        if (!nearlyEqual(change_acc[i], 0.0, eps_acc_change) && !nearlyEqual(last_change_acc[i], 0.0, eps_acc_change))
         {
           // Acceleration should only increase or be constant within one scaled timescale.
           // It should not fluctuate to zero or overshoot
@@ -706,10 +598,10 @@ TEST_F(SplineInterpolationTest, quintic_spline_with_end_point_velocity_with_spee
     plot_time += step_time_;
     loop_count += 1;
   }
-  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_SUCCESS, g_trajectory_result_);
+  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_SUCCESS, g_trajectory_result);
 
   // Make sure the velocity is zero when the trajectory has finished
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
   ASSERT_TRUE(data_pkg->getData("target_qd", joint_velocities));
   for (unsigned int i = 0; i < 6; ++i)
   {
@@ -728,8 +620,9 @@ TEST_F(SplineInterpolationTest, quintic_spline_with_end_point_velocity_with_spee
 
 TEST_F(SplineInterpolationTest, spline_interpolation_cubic)
 {
+  g_my_robot->stopConsumingRTDEData();
   std::unique_ptr<rtde_interface::DataPackage> data_pkg;
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
   urcl::vector6d_t joint_positions, joint_velocities, joint_acc;
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions));
   ASSERT_TRUE(data_pkg->getData("target_qd", joint_velocities));
@@ -767,7 +660,7 @@ TEST_F(SplineInterpolationTest, spline_interpolation_cubic)
 
   // Send the trajectory to the robot
   sendTrajectory(s_pos, s_vel, std::vector<urcl::vector6d_t>(), s_time);
-  g_trajectory_running_ = true;
+  g_trajectory_running = true;
 
   // Make sure that trajectory has started before we start testing for trajectory execution
   waitForTrajectoryStarted();
@@ -775,9 +668,9 @@ TEST_F(SplineInterpolationTest, spline_interpolation_cubic)
   int segment_idx = 0;
   double old_spline_travel_time = 0.0;
   double plot_time = 0.0;
-  while (g_trajectory_running_)
+  while (g_trajectory_running)
   {
-    readDataPackage(data_pkg);
+    g_my_robot->readDataPackage(data_pkg);
     ASSERT_TRUE(data_pkg->getData("target_q", joint_positions));
     ASSERT_TRUE(data_pkg->getData("target_qd", joint_velocities));
     ASSERT_TRUE(data_pkg->getData("target_qdd", joint_acc));
@@ -790,7 +683,8 @@ TEST_F(SplineInterpolationTest, spline_interpolation_cubic)
     spline_travel_time = (spline_travel_time == 0 ? spline_travel_time : spline_travel_time - step_time_);
 
     // Keep connection alive
-    ASSERT_TRUE(g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
+    ASSERT_TRUE(g_my_robot->ur_driver_->writeTrajectoryControlMessage(
+        urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
 
     if (old_spline_travel_time > spline_travel_time)
     {
@@ -818,7 +712,7 @@ TEST_F(SplineInterpolationTest, spline_interpolation_cubic)
     spline_time.push_back(spline_travel_time);
     plot_time += step_time_;
   }
-  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_SUCCESS, g_trajectory_result_);
+  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_SUCCESS, g_trajectory_result);
 
   // Verify that the full trajectory have been executed
   double spline_travel_time;
@@ -831,8 +725,9 @@ TEST_F(SplineInterpolationTest, spline_interpolation_cubic)
 
 TEST_F(SplineInterpolationTest, spline_interpolation_quintic)
 {
+  g_my_robot->stopConsumingRTDEData();
   std::unique_ptr<rtde_interface::DataPackage> data_pkg;
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
 
   urcl::vector6d_t joint_positions, joint_velocities, joint_acc;
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions));
@@ -877,7 +772,7 @@ TEST_F(SplineInterpolationTest, spline_interpolation_quintic)
 
   // Send the trajectory to the robot
   sendTrajectory(s_pos, s_vel, s_acc, s_time);
-  g_trajectory_running_ = true;
+  g_trajectory_running = true;
 
   // Make sure that trajectory has started before we start testing for trajectory execution
   waitForTrajectoryStarted();
@@ -885,10 +780,10 @@ TEST_F(SplineInterpolationTest, spline_interpolation_quintic)
   int segment_idx = 0;
   double old_spline_travel_time = 0.0;
   double plot_time = 0.0;
-  g_trajectory_running_ = true;
-  while (g_trajectory_running_)
+  g_trajectory_running = true;
+  while (g_trajectory_running)
   {
-    readDataPackage(data_pkg);
+    g_my_robot->readDataPackage(data_pkg);
     ASSERT_TRUE(data_pkg->getData("target_q", joint_positions));
     ASSERT_TRUE(data_pkg->getData("target_qd", joint_velocities));
     ASSERT_TRUE(data_pkg->getData("target_qdd", joint_acc));
@@ -901,7 +796,8 @@ TEST_F(SplineInterpolationTest, spline_interpolation_quintic)
     spline_travel_time = (spline_travel_time == 0 ? spline_travel_time : spline_travel_time - step_time_);
 
     // Keep connection alive
-    ASSERT_TRUE(g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
+    ASSERT_TRUE(g_my_robot->ur_driver_->writeTrajectoryControlMessage(
+        urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
 
     if (old_spline_travel_time > spline_travel_time)
     {
@@ -928,7 +824,7 @@ TEST_F(SplineInterpolationTest, spline_interpolation_quintic)
     spline_time.push_back(spline_travel_time);
     plot_time += step_time_;
   }
-  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_SUCCESS, g_trajectory_result_);
+  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_SUCCESS, g_trajectory_result);
 
   // Verify that the full trajectory have been executed
   double spline_travel_time;
@@ -941,14 +837,15 @@ TEST_F(SplineInterpolationTest, spline_interpolation_quintic)
 
 TEST_F(SplineInterpolationTest, zero_time_trajectory_cubic_spline)
 {
+  g_my_robot->stopConsumingRTDEData();
   std::unique_ptr<rtde_interface::DataPackage> data_pkg;
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
 
   urcl::vector6d_t joint_positions_before;
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions_before));
 
   // Start consuming rtde packages to avoid pipeline overflows while testing that the control script aborts correctly
-  g_consume_rtde_packages_ = true;
+  g_my_robot->startConsumingRTDEData();
 
   // Create illegal trajectory
   std::vector<urcl::vector6d_t> s_pos, s_vel;
@@ -970,19 +867,19 @@ TEST_F(SplineInterpolationTest, zero_time_trajectory_cubic_spline)
 
   // Send illegal trajectory to the robot
   sendTrajectory(s_pos, s_vel, std::vector<urcl::vector6d_t>(), s_time);
-  g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP, -1,
-                                              RobotReceiveTimeout::off());
+  g_my_robot->ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP, -1,
+                                                        RobotReceiveTimeout::off());
 
   // When an illegal trajectory is send to the robot, the control script should keep running but the trajectory result
   // should be canceled.
-  ASSERT_FALSE(waitForProgramNotRunning(1000));
-  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_CANCELED, g_trajectory_result_);
+  ASSERT_FALSE(g_my_robot->waitForProgramNotRunning(1000));
+  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_CANCELED, g_trajectory_result);
 
   // Stop consuming rtde packages
-  g_consume_rtde_packages_ = false;
+  g_my_robot->stopConsumingRTDEData();
 
   // Ensure that the robot hasn't moved
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
   urcl::vector6d_t joint_positions_after;
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions_after));
   for (unsigned int i = 0; i < 6; ++i)
@@ -1002,17 +899,18 @@ TEST_F(SplineInterpolationTest, zero_time_trajectory_cubic_spline)
   s_vel = { zeros, zeros, zeros };
   s_time = { 0.0, 1.0, 2.0 };
   sendTrajectory(s_pos, s_vel, std::vector<urcl::vector6d_t>(), s_time);
-  g_trajectory_running_ = true;
+  g_trajectory_running = true;
   waitForTrajectoryStarted();
   urcl::vector6d_t joint_positions;
-  while (g_trajectory_running_)
+  while (g_trajectory_running)
   {
-    readDataPackage(data_pkg);
+    g_my_robot->readDataPackage(data_pkg);
     ASSERT_TRUE(data_pkg->getData("target_q", joint_positions));
     // Keep connection alive
-    ASSERT_TRUE(g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
+    ASSERT_TRUE(g_my_robot->ur_driver_->writeTrajectoryControlMessage(
+        urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
   }
-  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_SUCCESS, g_trajectory_result_);
+  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_SUCCESS, g_trajectory_result);
 
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions_after));
   for (unsigned int i = 0; i < 6; ++i)
@@ -1023,14 +921,15 @@ TEST_F(SplineInterpolationTest, zero_time_trajectory_cubic_spline)
 
 TEST_F(SplineInterpolationTest, zero_time_trajectory_quintic_spline)
 {
+  g_my_robot->stopConsumingRTDEData();
   std::unique_ptr<rtde_interface::DataPackage> data_pkg;
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
 
   urcl::vector6d_t joint_positions_before;
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions_before));
 
   // Start consuming rtde packages to avoid pipeline overflows while testing
-  g_consume_rtde_packages_ = true;
+  g_my_robot->startConsumingRTDEData();
 
   // Create illegal trajectory
   std::vector<urcl::vector6d_t> s_pos, s_vel, s_acc;
@@ -1048,19 +947,19 @@ TEST_F(SplineInterpolationTest, zero_time_trajectory_quintic_spline)
 
   // Send illegal trajectory to the robot
   sendTrajectory(s_pos, s_vel, s_acc, s_time);
-  g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP, -1,
-                                              RobotReceiveTimeout::off());
+  g_my_robot->ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP, -1,
+                                                        RobotReceiveTimeout::off());
 
   // When an illegal trajectory is send to the robot, the control script should keep running but the trajectory result
   // should be canceled
-  ASSERT_FALSE(waitForProgramNotRunning(1000));
-  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_CANCELED, g_trajectory_result_);
+  ASSERT_FALSE(g_my_robot->waitForProgramNotRunning(1000));
+  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_CANCELED, g_trajectory_result);
 
   // Stop consuming rtde packages
-  g_consume_rtde_packages_ = false;
+  g_my_robot->stopConsumingRTDEData();
 
   // Ensure that the robot hasn't moved
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
   urcl::vector6d_t joint_positions_after;
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions_after));
   for (unsigned int i = 0; i < 6; ++i)
@@ -1081,17 +980,18 @@ TEST_F(SplineInterpolationTest, zero_time_trajectory_quintic_spline)
   s_acc = { zeros, zeros, zeros };
   s_time = { 0.0, 1.0, 2.0 };
   sendTrajectory(s_pos, s_vel, s_acc, s_time);
-  g_trajectory_running_ = true;
+  g_trajectory_running = true;
   waitForTrajectoryStarted();
   urcl::vector6d_t joint_positions;
-  while (g_trajectory_running_)
+  while (g_trajectory_running)
   {
-    readDataPackage(data_pkg);
+    g_my_robot->readDataPackage(data_pkg);
     ASSERT_TRUE(data_pkg->getData("target_q", joint_positions));
     // Keep connection alive
-    ASSERT_TRUE(g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
+    ASSERT_TRUE(g_my_robot->ur_driver_->writeTrajectoryControlMessage(
+        urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
   }
-  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_SUCCESS, g_trajectory_result_);
+  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_SUCCESS, g_trajectory_result);
 
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions_after));
   for (unsigned int i = 0; i < 6; ++i)
@@ -1102,14 +1002,15 @@ TEST_F(SplineInterpolationTest, zero_time_trajectory_quintic_spline)
 
 TEST_F(SplineInterpolationTest, physically_unfeasible_trajectory_cubic_spline)
 {
+  g_my_robot->stopConsumingRTDEData();
   std::unique_ptr<rtde_interface::DataPackage> data_pkg;
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
 
   urcl::vector6d_t joint_positions_before;
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions_before));
 
   // Start consuming rtde packages to avoid pipeline overflows while testing that the control script aborts correctly
-  g_consume_rtde_packages_ = true;
+  g_my_robot->startConsumingRTDEData();
 
   // Create a trajectory that cannot be executed within the robots limits
   std::vector<urcl::vector6d_t> s_pos, s_vel;
@@ -1126,19 +1027,19 @@ TEST_F(SplineInterpolationTest, physically_unfeasible_trajectory_cubic_spline)
 
   // Send unfeasible trajectory to the robot
   sendTrajectory(s_pos, s_vel, std::vector<urcl::vector6d_t>(), s_time);
-  g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP, -1,
-                                              RobotReceiveTimeout::off());
+  g_my_robot->ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP, -1,
+                                                        RobotReceiveTimeout::off());
 
   // When an unfeasible trajectory is send to the robot, the control script should keep running but the trajectory
   // result should be canceled
-  ASSERT_FALSE(waitForProgramNotRunning(1000));
-  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_CANCELED, g_trajectory_result_);
+  ASSERT_FALSE(g_my_robot->waitForProgramNotRunning(1000));
+  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_CANCELED, g_trajectory_result);
 
   // Stop consuming rtde packages
-  g_consume_rtde_packages_ = false;
+  g_my_robot->stopConsumingRTDEData();
 
   // Ensure that the robot hasn't moved
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
   urcl::vector6d_t joint_positions_after;
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions_after));
   for (unsigned int i = 0; i < 6; ++i)
@@ -1149,14 +1050,15 @@ TEST_F(SplineInterpolationTest, physically_unfeasible_trajectory_cubic_spline)
 
 TEST_F(SplineInterpolationTest, physically_unfeasible_trajectory_quintic_spline)
 {
+  g_my_robot->stopConsumingRTDEData();
   std::unique_ptr<rtde_interface::DataPackage> data_pkg;
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
 
   urcl::vector6d_t joint_positions_before;
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions_before));
 
   // Start consuming rtde packages to avoid pipeline overflows while testing that the control script aborts correctly
-  g_consume_rtde_packages_ = true;
+  g_my_robot->startConsumingRTDEData();
 
   // Create a trajectory that cannot be executed within the robots limits
   std::vector<urcl::vector6d_t> s_pos, s_vel, s_acc;
@@ -1174,25 +1076,71 @@ TEST_F(SplineInterpolationTest, physically_unfeasible_trajectory_quintic_spline)
 
   // Send unfeasible trajectory to the robot
   sendTrajectory(s_pos, s_vel, s_acc, s_time);
-  g_ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP, -1,
-                                              RobotReceiveTimeout::off());
+  g_my_robot->ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP, -1,
+                                                        RobotReceiveTimeout::off());
 
   // When an unfeasible trajectory is send to the robot, the control script should keep running but the trajectory
   // result should be canceled
-  ASSERT_FALSE(waitForProgramNotRunning(1000));
-  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_CANCELED, g_trajectory_result_);
+  ASSERT_FALSE(g_my_robot->waitForProgramNotRunning(1000));
+  EXPECT_EQ(control::TrajectoryResult::TRAJECTORY_RESULT_CANCELED, g_trajectory_result);
 
   // Stop consuming rtde packages
-  g_consume_rtde_packages_ = false;
+  g_my_robot->stopConsumingRTDEData();
 
   // Ensure that the robot hasn't moved
-  readDataPackage(data_pkg);
+  g_my_robot->readDataPackage(data_pkg);
   urcl::vector6d_t joint_positions_after;
   ASSERT_TRUE(data_pkg->getData("target_q", joint_positions_after));
   for (unsigned int i = 0; i < 6; ++i)
   {
     EXPECT_FLOAT_EQ(joint_positions_before[i], joint_positions_after[i]);
   }
+}
+
+TEST_F(SplineInterpolationTest, switching_control_mode_without_trajectory_produces_no_result)
+{
+  // We start by putting the robot into trajectory control mode
+  ASSERT_TRUE(
+      g_my_robot->ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP));
+
+  // Then we switch to idle
+  ASSERT_TRUE(g_my_robot->ur_driver_->writeKeepalive(RobotReceiveTimeout::sec(2)));
+
+  EXPECT_FALSE(waitForTrajectoryResult(std::chrono::milliseconds(500)));
+}
+
+TEST_F(SplineInterpolationTest, switching_control_mode_with_trajectory_produces_result)
+{
+  g_my_robot->stopConsumingRTDEData();
+  std::unique_ptr<rtde_interface::DataPackage> data_pkg;
+  g_my_robot->readDataPackage(data_pkg);
+
+  urcl::vector6d_t joint_positions_before;
+  ASSERT_TRUE(data_pkg->getData("target_q", joint_positions_before));
+
+  // Start consuming rtde packages to avoid pipeline overflows while testing that the control script aborts correctly
+  g_my_robot->startConsumingRTDEData();
+  // Create a trajectory that cannot be executed within the robots limits
+  std::vector<urcl::vector6d_t> s_pos, s_vel, s_acc;
+  urcl::vector6d_t first_point = {
+    joint_positions_before[0], joint_positions_before[1], joint_positions_before[2],
+    joint_positions_before[3], joint_positions_before[4], joint_positions_before[5] + 0.5
+  };
+  s_pos.push_back(first_point);
+
+  urcl::vector6d_t zeros = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+  s_vel.push_back(zeros);
+  s_acc.push_back(zeros);
+
+  std::vector<double> s_time = { 0.02 };
+  sendTrajectory(s_pos, s_vel, s_acc, s_time);
+  g_my_robot->ur_driver_->writeTrajectoryControlMessage(urcl::control::TrajectoryControlMessage::TRAJECTORY_NOOP, -1,
+                                                        RobotReceiveTimeout::off());
+
+  // Then we switch to idle
+  ASSERT_TRUE(g_my_robot->ur_driver_->writeKeepalive(RobotReceiveTimeout::sec(2)));
+
+  EXPECT_TRUE(waitForTrajectoryResult(std::chrono::milliseconds(500)));
 }
 
 int main(int argc, char* argv[])
@@ -1203,7 +1151,13 @@ int main(int argc, char* argv[])
   {
     if (std::string(argv[i]) == "--robot_ip" && i + 1 < argc)
     {
-      ROBOT_IP = argv[i + 1];
+      g_ROBOT_IP = argv[i + 1];
+      break;
+    }
+    if (std::string(argv[i]) == "--headless" && i + 1 < argc)
+    {
+      std::string headless = argv[i + 1];
+      g_HEADLESS = headless == "true" || headless == "1" || headless == "True" || headless == "TRUE";
       break;
     }
   }

@@ -57,10 +57,8 @@ int main(int argc, char* argv[])
     robot_ip = std::string(argv[1]);
   }
 
-  // Making the robot ready for the program by:
-  // Connect the the robot Dashboard
-  std::unique_ptr<DashboardClient> my_dashboard;
-  my_dashboard.reset(new DashboardClient(robot_ip));
+  // Connect to the robot Dashboard Server
+  auto my_dashboard = std::make_unique<DashboardClient>(robot_ip);
   if (!my_dashboard->connect())
   {
     URCL_LOG_ERROR("Could not connect to dashboard");
@@ -72,6 +70,11 @@ int main(int argc, char* argv[])
     URCL_LOG_ERROR("Could not send power off");
     return 1;
   }
+
+  // Get the PolyScope version
+  std::string version;
+  my_dashboard->commandPolyscopeVersion(version);
+  URCL_LOG_INFO(version.c_str());
 
   my_dashboard->commandCloseSafetyPopup();
 
@@ -141,7 +144,13 @@ int main(int argc, char* argv[])
     return 1;
   }
 
-  // Now the robot is ready to receive a program
+  // Make a raw request and save the response
+  std::string program_state = my_dashboard->sendAndReceive("programState");
+  URCL_LOG_INFO("Program state: %s", program_state.c_str());
+
+  // The response can be checked with a regular expression
+  bool success = my_dashboard->sendRequest("power off", "Powering off");
+  URCL_LOG_INFO("Power off command success: %d", success);
 
   return 0;
 }
