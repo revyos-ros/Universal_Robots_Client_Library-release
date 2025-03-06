@@ -40,8 +40,8 @@ namespace urcl
  * for the server's response.
  *
  * For documentation about the dashboard server, please see
- *  - https://www.universal-robots.com/how-tos-and-faqs/how-to/ur-how-tos/dashboard-server-cb-series-port-29999-15690/
- *  - https://www.universal-robots.com/how-tos-and-faqs/how-to/ur-how-tos/dashboard-server-e-series-port-29999-42728/
+ *  - https://www.universal-robots.com/articles/ur/dashboard-server-cb-series-port-29999/
+ *  - https://www.universal-robots.com/articles/ur/dashboard-server-e-series-port-29999/
  */
 class DashboardClient : public comm::TCPSocket
 {
@@ -89,7 +89,7 @@ public:
    * \brief Sends command and compare it with the expected answer
    *
    * \param command Command that will be sent to the server.
-   * \param expected Expected response
+   * \param expected Expected response as a regex string
    *
    * \return True if the reply to the command is as expected
    */
@@ -99,7 +99,7 @@ public:
    * \brief Sends command and compare it with the expected answer
    *
    * \param command Command that will be sent to the server.
-   * \param expected Expected response
+   * \param expected Expected response as a regex string
    *
    * \throws UrException if the received answer does not match the expected one.
    *
