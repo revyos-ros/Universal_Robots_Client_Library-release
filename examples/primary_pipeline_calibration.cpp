@@ -26,37 +26,40 @@ using namespace urcl;
 class CalibrationConsumer : public urcl::comm::IConsumer<urcl::primary_interface::PrimaryPackage>
 {
 public:
-  CalibrationConsumer() : calibrated_(0), have_received_data(false)
+  CalibrationConsumer() : calibrated_(0), have_received_data_(false)
   {
   }
   virtual ~CalibrationConsumer() = default;
 
+  // This will consume any primary package
   virtual bool consume(std::shared_ptr<urcl::primary_interface::PrimaryPackage> product)
   {
+    // Try to cast the product to a KinematicsInfo package. If that succeeds, we handle the
+    // calibration information.
     auto kin_info = std::dynamic_pointer_cast<urcl::primary_interface::KinematicsInfo>(product);
     if (kin_info != nullptr)
     {
       URCL_LOG_INFO("%s", product->toString().c_str());
       calibrated_ = kin_info->calibration_status_;
-      have_received_data = true;
+      have_received_data_ = true;
     }
     return true;
   }
 
   bool isCalibrated() const
   {
-    const uint32_t LINEARIZED = 2;
-    return calibrated_ == LINEARIZED;
+    const uint32_t linearized = 2;
+    return calibrated_ == linearized;
   }
 
   bool calibrationStatusReceived()
   {
-    return have_received_data;
+    return have_received_data_;
   }
 
 private:
   uint32_t calibrated_;
-  bool have_received_data;
+  bool have_received_data_;
 };
 
 // In a real-world example it would be better to get those values from command line parameters / a better configuration
@@ -105,11 +108,11 @@ int main(int argc, char* argv[])
 
   if (calib_consumer.isCalibrated())
   {
-    printf("The robot on IP: %s is calibrated\n", robot_ip.c_str());
+    printf("The robot on IP: %s is calibrated.\n", robot_ip.c_str());
   }
   else
   {
-    printf("The robot controller on IP: %s do not have a valid calibration\n", robot_ip.c_str());
+    printf("The robot controller on IP: %s does not have a valid calibration.\n", robot_ip.c_str());
     printf("Remeber to turn on the robot to get calibration stored on the robot!\n");
   }
 
